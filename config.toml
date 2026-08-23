@@ -1,0 +1,22 @@
+[plugin]
+enabled = true
+config_version = "0.2.0"
+
+[schedule]
+# 到点扫描间隔（秒）
+scan_interval_seconds = 20
+# 每个聊天流最多同时挂起的提醒数（防刷）
+max_pending_per_stream = 20
+# 默认提前提醒量（分钟）。通用默认关闭；
+# 排小粥建议：训练/比赛类活动提前 120 分钟（改成 [120]）按需开启
+default_advance_minutes = []
+
+[parse]
+# 时间解析用的模型任务名（空 = 宿主默认 utils 任务）
+model_task = ""
+
+[delivery]
+# 到点提醒首选 proactive.trigger（由 bot 本体口吻生成，人设一致）
+use_proactive = true
+# proactive 入队后这么多秒仍未确认 bot 发过言，则兜底直发（0 = 不验证）
+fallback_after_seconds = 120

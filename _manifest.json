@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "version": "0.1.1",
+  "name": "自然语言提醒",
+  "description": "通过自然对话设置定时提醒：『明晚7点提醒我训练』『10分钟后叫我』。到点提醒由 bot 本体口吻发出（走主链路生成，无人设硬编码），支持提前提醒、取消与查询，重启不丢任务。",
+  "author": {
+    "name": "DCY501",
+    "url": "https://github.com/DCY501"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/DCY501/maibot-reminder-plugin",
+    "homepage": "https://github.com/DCY501/maibot-reminder-plugin",
+    "issues": "https://github.com/DCY501/maibot-reminder-plugin/issues"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.2.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "llm.generate",
+    "config.get",
+    "message.get_recent",
+    "maisaka.proactive.trigger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "paixiaozhou.reminder"
+}
