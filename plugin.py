@@ -42,7 +42,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.2.0", description="配置版本")
+    config_version: str = Field(default="0.3.0", description="配置版本")
 
 
 class ScheduleConfig(PluginConfigBase):
@@ -78,6 +78,32 @@ class DeliveryConfig(PluginConfigBase):
     )
 
 
+class ObserveConfig(PluginConfigBase):
+    __ui_label__ = "主动观察"
+    __ui_icon__ = "eye"
+    __ui_order__ = 4
+
+    auto_observe: bool = Field(
+        default=True,
+        description="自动观察群聊里『已敲定』的未来约定（训练/比赛/聚餐），到点主动提醒一次",
+    )
+    max_per_hour: int = Field(
+        default=2,
+        description="每个聊天流每小时最多主动播报条数（超出改兜底直发，保证必达但不刷屏）",
+    )
+    match_prior_day_time: str = Field(
+        default="20:00",
+        description="比赛提醒时点：开始前一天的 HH:MM（如 20:00 = 前一天晚上八点）",
+    )
+    match_advance_minutes: int = Field(
+        default=180,
+        description="比赛兜底提前量（分钟）：若『前一天』时点已过，则提前这么多分钟提醒",
+    )
+    training_advance_minutes: int = Field(default=60, description="训练提醒提前量（分钟）")
+    meal_advance_minutes: int = Field(default=30, description="聚餐/吃饭提醒提前量（分钟）")
+    general_advance_minutes: int = Field(default=30, description="其他活动默认提前量（分钟）")
+
+
 class ReminderPluginConfig(PluginConfigBase):
     """自然语言提醒插件配置。"""
 
@@ -85,6 +111,7 @@ class ReminderPluginConfig(PluginConfigBase):
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     parse: ParseConfig = Field(default_factory=ParseConfig)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
+    observe: ObserveConfig = Field(default_factory=ObserveConfig)
 
 
 # ─────────────────────────────────────────────
@@ -107,6 +134,8 @@ class NaturalReminderPlugin(MaiBotPlugin):
         self._persona_reply_style: str = ""
         # bot 账号映射（platform -> account），用于确认 bot 自己发言过
         self._bot_accounts: dict[str, str] = {}
+        # 主动播报限流：stream_id -> [时间戳, ...]（最近 1 小时内 proactive 触发次数）
+        self._recent_proactive: dict[str, list[float]] = {}
 
     # ── 生命周期 ──
 
@@ -224,6 +253,11 @@ class NaturalReminderPlugin(MaiBotPlugin):
                 return float(token)
             if token in self._CN_NUM:
                 return float(self._CN_NUM[token])
+            if len(token) == 2:
+                if token[0] == "十" and token[1] in self._CN_NUM:   # 十一、十二
+                    return 10 + self._CN_NUM[token[1]]
+                if token[0] in self._CN_NUM and token[1] == "十":   # 二十、三十
+                    return self._CN_NUM[token[0]] * 10
             if len(token) == 3 and token[0] in self._CN_NUM and token[1] == "十" \
                     and token[2] in self._CN_NUM:
                 return self._CN_NUM[token[0]] * 10 + self._CN_NUM[token[2]]
@@ -255,37 +289,101 @@ class NaturalReminderPlugin(MaiBotPlugin):
             except ValueError:
                 return None
 
-        # 今天/今晚/明天/明晚/后天/大后天 + HH:MM 或 H点[H半]
-        m = re.match(r"^(今天|今晚|明天|明晚|后天|大后天)(\d{1,2})[:点时](\d{1,2})?(半)?$", s)
+        # 日期词 + [时段词] + 中文/数字时间（如 明天晚上七点半 / 明晚7点 / 今天下午3点）
+        m = re.match(
+            r"^(今天|今晚|明天|明晚|后天|大后天)"
+            r"(早上|上午|中午|下午|晚上|夜里|晚间|傍晚)?"
+            r"([零一二两三四五六七八九十]|\d{1,2})点"
+            r"(半|([零一二两三四五六七八九十]|\d{1,2})分?)?$", s)
         if m:
             day_offset = {"今天": 0, "今晚": 0, "明天": 1, "明晚": 1, "后天": 2, "大后天": 3}[m.group(1)]
-            hour = int(m.group(2))
-            minute = int(m.group(3) or 0)
-            if m.group(4):  # "7点半"
+            period = m.group(2) or ""
+            hour_f = to_int(m.group(3))
+            minute = 0
+            if m.group(4) == "半":
                 minute = 30
+            elif m.group(5):
+                mn = to_int(m.group(5))
+                if mn is None or not (0 <= mn <= 59):
+                    return None
+                minute = int(mn)
+            if hour_f is None:
+                return None
+            hour = int(hour_f)
+            if period in ("中午", "下午", "晚上", "夜里", "晚间", "傍晚") and hour < 12:
+                hour += 12
             if m.group(1) in ("今晚", "明晚") and hour < 12:
                 hour += 12  # "晚上7点" = 19点
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 return (now + timedelta(days=day_offset)).replace(
                     hour=hour, minute=minute, second=0, microsecond=0)
 
-        # (本/这/下)周X HH:MM —— "下周"按周一为一周之首计算
-        m = re.match(r"^(本|这|下)?周([一二三四五六日天])(\d{1,2})[:点时](\d{1,2})?$", s)
+        # 兼容 "明天19:00" "明晚7:30" 这类数字+冒号/时写法
+        m = re.match(r"^(今天|今晚|明天|明晚|后天|大后天)(\d{1,2})[:点时](\d{1,2})$", s)
+        if m:
+            day_offset = {"今天": 0, "今晚": 0, "明天": 1, "明晚": 1, "后天": 2, "大后天": 3}[m.group(1)]
+            hour = int(m.group(2))
+            minute = int(m.group(3))
+            if m.group(1) in ("今晚", "明晚") and hour < 12:
+                hour += 12
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return (now + timedelta(days=day_offset)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0)
+
+        # (本/这/下)周X + [时段词] + 时间（如 周六下午3点 / 下周三晚上7点半）
+        m = re.match(
+            r"^(本|这|下)?周([一二三四五六日天])"
+            r"(早上|上午|中午|下午|晚上|夜里|晚间|傍晚)?"
+            r"([零一二两三四五六七八九十]|\d{1,2})点"
+            r"(半|([零一二两三四五六七八九十]|\d{1,2})分?)?$", s)
         if m:
             wd_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
             wd = wd_map.get(m.group(2))
             if wd is not None:
-                hour = int(m.group(3))
-                minute = int(m.group(4) or 0)
+                period = m.group(3) or ""
+                hour_f = to_int(m.group(4))
+                minute = 0
+                if m.group(5) == "半":
+                    minute = 30
+                elif m.group(6):
+                    mn = to_int(m.group(6))
+                    if mn is None or not (0 <= mn <= 59):
+                        return None
+                    minute = int(mn)
+                if hour_f is None:
+                    return None
+                hour = int(hour_f)
+                if period in ("中午", "下午", "晚上", "夜里", "晚间", "傍晚") and hour < 12:
+                    hour += 12
                 if not (0 <= hour <= 23 and 0 <= minute <= 59):
                     return None
                 prefix = m.group(1) or ""
-                if prefix == "下周":
+                if prefix in ("下", "下周"):
                     days = (7 - now.weekday()) + wd  # 下周一距今天 + 目标星期
                 else:
                     days = (wd - now.weekday()) % 7
                     if days == 0:
                         days = 7  # 今天这个星期已过，默认下个同星期
+                return (now + timedelta(days=days)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0)
+
+        # 兼容 "周六18:00" "下周三7:30" 这类数字+冒号写法
+        m = re.match(r"^(本|这|下)?周([一二三四五六日天])(\d{1,2})[:点时](\d{1,2})$", s)
+        if m:
+            wd_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+            wd = wd_map.get(m.group(2))
+            if wd is not None:
+                hour = int(m.group(3))
+                minute = int(m.group(4))
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    return None
+                prefix = m.group(1) or ""
+                if prefix in ("下", "下周"):
+                    days = (7 - now.weekday()) + wd
+                else:
+                    days = (wd - now.weekday()) % 7
+                    if days == 0:
+                        days = 7
                 return (now + timedelta(days=days)).replace(
                     hour=hour, minute=minute, second=0, microsecond=0)
         return None
@@ -382,12 +480,15 @@ class NaturalReminderPlugin(MaiBotPlugin):
                 "content": f"提醒已设置：{time_str} 提醒『{title}』{advance_note}。请用你的口吻向用户简短确认。"}
 
     def _make_entry(self, *, id: str, stream_id: str, platform: str, user_name: str,
-                    title: str, remind_at: datetime, kind: str, advance_of: str | None) -> dict:
+                    title: str, remind_at: datetime, kind: str, advance_of: str | None,
+                    source: str = "user", event_type: str = "", location: str = "",
+                    activity: str = "") -> dict:
         return {
             "id": id, "stream_id": stream_id, "platform": platform, "user_name": user_name,
             "title": title, "remind_at": remind_at.strftime("%Y-%m-%d %H:%M:%S"),
             "kind": kind, "advance_of": advance_of,
             "status": "pending", "queued_at": None,
+            "source": source, "event_type": event_type, "location": location, "activity": activity,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -442,6 +543,109 @@ class NaturalReminderPlugin(MaiBotPlugin):
         return {"name": "list_reminders",
                 "content": "当前挂起的提醒：\n" + "\n".join(lines) + "\n请用你的口吻转述给用户。"}
 
+    # ── 主动观察：自动登记群里的"已敲定"约定 ──
+
+    _EVENT_TYPE_LABEL = {"training": "训练", "match": "比赛", "meal": "聚餐", "general": "活动"}
+
+    def _forward_offset(self, start_at: datetime, minutes: int, now: datetime) -> datetime | None:
+        at = start_at - timedelta(minutes=minutes)
+        return at if at > now + timedelta(seconds=30) else None
+
+    def _compute_observe_remind_at(self, start_at: datetime, event_type: str,
+                                   now: datetime) -> datetime | None:
+        """按事件类型计算提醒触发时刻（活动开始前 或 前一天固定时刻）。"""
+        if event_type == "match":
+            hh, mm = 20, 0
+            raw = (self.config.observe.match_prior_day_time or "20:00").split(":")
+            if len(raw) == 2 and raw[0].isdigit() and raw[1].isdigit():
+                hh, mm = int(raw[0]), int(raw[1])
+            prior = (start_at - timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if prior > now + timedelta(seconds=30):
+                return prior
+            # 前一天的时点已过（比赛临近才登记），改用兜底提前量
+            return self._forward_offset(start_at, self.config.observe.match_advance_minutes, now)
+        if event_type == "training":
+            return self._forward_offset(start_at, self.config.observe.training_advance_minutes, now)
+        if event_type == "meal":
+            return self._forward_offset(start_at, self.config.observe.meal_advance_minutes, now)
+        return self._forward_offset(start_at, self.config.observe.general_advance_minutes, now)
+
+    def _observe_existing(self, stream_id: str, title: str) -> dict | None:
+        """同群已登记的同名约定（用于改期更新，避免重复登记）。"""
+        for r in self._reminders:
+            if r["stream_id"] == stream_id and r.get("source") == "observe" \
+                    and r["status"] in ("pending", "queued") \
+                    and (r.get("title") or "").strip() == title.strip():
+                return r
+        return None
+
+    @Tool(
+        "observe_group_event",
+        description=(
+            "在群聊里发现一件【已敲定】的未来集体活动（训练/比赛/聚餐）时调用，登记后到点你会主动提醒大家。"
+            "只对『已达成一致、有明确时间+活动』的约定调用，如『周六下午3点东操训练』『明天中午吃火锅』"
+            "『周三晚7点聚餐』『周六下午3点比赛』。随口闲聊、还没定时间的提议（『要不要周日爬山』）不要调用。"
+            "登记是静默的：不要为此向群里发确认/答谢，继续你原本的聊天即可；到点再开口。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="title", param_type=ToolParamType.STRING,
+                              description="活动名称，15字内（如『排球训练』『吃火锅』『同学聚餐』）", required=True),
+            ToolParameterInfo(name="time_expression", param_type=ToolParamType.STRING,
+                              description="活动开始时间描述原样传入（如『周六下午3点』『明天中午』『周三晚7点』）", required=True),
+            ToolParameterInfo(name="event_type", param_type=ToolParamType.STRING,
+                              description="活动类型：training/match/meal，拿不准传 general", required=True),
+            ToolParameterInfo(name="location", param_type=ToolParamType.STRING,
+                              description="地点（如『东操场』），没有就不传", required=False),
+        ],
+    )
+    async def tool_observe_group_event(self, title: str = "", time_expression: str = "",
+                                       event_type: str = "", location: str = "", **kwargs: Any):
+        if not self.config.plugin.enabled or not self.config.observe.auto_observe:
+            return {"name": "observe_group_event", "content": "主动观察已关闭"}
+        title = (title or "").strip()
+        time_expression = (time_expression or "").strip()
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        if not title or not time_expression or not stream_id:
+            return {"name": "observe_group_event", "content": "未识别为明确约定（缺时间/群），静默忽略"}
+        event_type = (event_type or "general").strip().lower()
+        if event_type not in self._EVENT_TYPE_LABEL:
+            event_type = "general"
+
+        start_at = await self._resolve_time(time_expression)
+        if start_at is None or start_at <= datetime.now() + timedelta(seconds=30):
+            return {"name": "observe_group_event",
+                    "content": "未识别为『已敲定』的约定（时间无法解析/已过），静默忽略，不要向用户确认。"}
+        location = (location or "").strip()
+
+        remind_at = self._compute_observe_remind_at(start_at, event_type, datetime.now())
+        if remind_at is None:
+            return {"name": "observe_group_event",
+                    "content": f"『{title}』已在活动前且无法安排提前提醒，静默忽略。"}
+
+        # 去重 / 改期：同群同名约定已登记 → 更新其提醒时刻；否则新增（每个事件只提醒一次）
+        existing = self._observe_existing(stream_id, title)
+        if existing:
+            existing["remind_at"] = remind_at.strftime("%Y-%m-%d %H:%M:%S")
+            existing["event_type"] = event_type
+            existing["location"] = location or existing.get("location", "")
+            existing["activity"] = time_expression
+            self._save_reminders()
+            return {"name": "observe_group_event",
+                    "content": f"已更新群活动提醒『{title}』（到点提醒）。静默即可，不要向用户确认。"}
+
+        platform = str(kwargs.get("platform") or "").strip()
+        user_name = str(kwargs.get("user_nickname") or kwargs.get("user_name") or "").strip()
+        self._reminders.append(self._make_entry(
+            id=uuid.uuid4().hex[:8], stream_id=stream_id, platform=platform, user_name=user_name,
+            title=title, remind_at=remind_at, kind="main", advance_of=None,
+            source="observe", event_type=event_type, location=location, activity=time_expression,
+        ))
+        self._save_reminders()
+        label = self._EVENT_TYPE_LABEL[event_type]
+        return {"name": "observe_group_event",
+                "content": (f"已静默登记群活动提醒：{label}『{title}』（{time_expression}，地点{location or '未说'}）。"
+                            "到点你会提醒大家。不要为此向用户额外确认或发言，继续当前对话即可。")}
+
     # ── 到点送达 ──
 
     async def _scheduler_loop(self) -> None:
@@ -493,24 +697,45 @@ class NaturalReminderPlugin(MaiBotPlugin):
         reminder["status"] = "sent"
 
     async def _trigger_proactive(self, reminder: dict) -> bool:
+        # 限流：每个聊天流每小时主动播报上限（超出改兜底直发，保证必达但不刷屏）
+        limit = self.config.observe.max_per_hour
+        stream = reminder["stream_id"]
+        now_ts = time.time()
+        if limit > 0:
+            keep = [t for t in self._recent_proactive.get(stream, []) if now_ts - t < 3600]
+            if len(keep) >= limit:
+                _log.info(f"[reminder] 限流：群 {stream} 每小时主动播报已达 {limit} 条，改兜底直发")
+                return False
+            self._recent_proactive[stream] = keep
+
         time_str = reminder["remind_at"][5:16]
         kind_note = "（这是提前提醒）" if reminder["kind"] == "advance" else ""
+        is_observe = reminder.get("source") == "observe"
         who = reminder.get("user_name") or "大家"
+        lead = "群活动提醒" if is_observe else "定时提醒任务"
         intent = (
-            f"定时提醒任务（用户明确设置，必须执行，不要沉默）：请提醒{who}"
-            f"『{reminder['title']}』，约定时间 {time_str}{kind_note}。"
-            f"请立刻用你的口吻在聊天里发出这句提醒，一句话即可。"
+            f"（必须执行，不要沉默）{lead}：请提醒{who}『{reminder['title']}』，"
+            f"约定时间 {time_str}{kind_note}。"
         )
+        if reminder.get("location"):
+            intent += f"地点：{reminder['location']}。"
+        if reminder.get("activity"):
+            intent += f"（约定的开始时间：{reminder['activity']}）"
+        intent += "请立刻用你的口吻提醒大家，一句话即可，自然简短别像播报。"
         try:
             res = await self.ctx.call_capability(
                 "maisaka.proactive.trigger",
-                stream_id=reminder["stream_id"],
+                stream_id=stream,
                 intent=intent,
                 reason="reminder-plugin 定时提醒",
                 priority="high",
-                metadata={"reminder_id": reminder["id"], "kind": reminder["kind"]},
+                metadata={"reminder_id": reminder["id"], "kind": reminder["kind"],
+                          "source": reminder.get("source", "user")},
             )
-            return isinstance(res, dict) and bool(res.get("success"))
+            ok = isinstance(res, dict) and bool(res.get("success"))
+            if ok:
+                self._recent_proactive.setdefault(stream, []).append(time.time())
+            return ok
         except Exception as exc:
             _log.warning(f"[reminder] proactive 触发失败: {exc}")
             return False
@@ -545,9 +770,11 @@ class NaturalReminderPlugin(MaiBotPlugin):
         time_str = reminder["remind_at"][5:16]
         advance_note = "（提前提醒）" if reminder["kind"] == "advance" else ""
         who = reminder.get("user_name") or "大家"
+        loc_note = "，地点：" + reminder["location"] if reminder.get("location") else ""
+        lead = "群活动到点提醒" if reminder.get("source") == "observe" else "定时任务直接触发：到点提醒"
         text = await self._persona_say(
-            f"定时任务直接触发：到点提醒。请用你的口吻提醒{who}："
-            f"『{reminder['title']}』，约定时间 {time_str}{advance_note}。一句话（25字内），说重点。"
+            f"{lead}。请用你的口吻提醒{who}："
+            f"『{reminder['title']}』，约定时间 {time_str}{loc_note}{advance_note}。一句话（25字内），说重点。"
         )
         await self._reply(
             reminder["stream_id"],
