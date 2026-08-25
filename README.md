@@ -18,7 +18,9 @@
 | `cancel_reminder(title?)` | 取消挂起的提醒（不特指则取消最近一个） |
 | `list_reminders()` | 列出当前聊天挂起的提醒 |
 
-## 配置（config.toml）
+## 配置（config.example.toml）
+
+仓库只提供模板 `config.example.toml`，请复制为 `config.toml` 后按需修改（`config.toml` 已在 .gitignore 中，不会被提交）：
 
 ```toml
 [schedule]
@@ -28,6 +30,11 @@ default_advance_minutes = []      # 默认提前提醒（分钟），如 [120]
 use_proactive = true              # 到点走主链路生成（口吻一致）
 fallback_after_seconds = 120      # 未确认发言则兜底直发
 ```
+
+## 能力与隐私说明
+
+- **`message.get_recent`**：仅用于"兜底验证"——`_bot_spoke_since` 在提醒入队后拉取最近 10 条消息，判断 **bot 自己**是否已发过言（据此决定是否需要兜底直发）。**只用于判断 bot 自身账号的发言状态，不记录、不存储、不上传任何聊天内容**。
+- **`maisaka.proactive.trigger`**：MaiBot 宿主通过 plugin_runtime 向插件公开的正式能力（capabilities 注册项），用于请求主链路主动发起一轮对话（到点提醒由主链路以宿主人设生成，插件不硬编码口吻）。已在 MaiBot 1.2.x 实测稳定，非私有/未承诺实现。
 
 
 ## 安装
